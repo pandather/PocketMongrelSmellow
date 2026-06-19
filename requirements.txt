@@ -1,0 +1,3 @@
+# Runtime dependency for real BLE support.
+# The bridge can run with --no-ble without this, but real Omara Bluetooth needs bleak.
+bleak>=0.22.0
