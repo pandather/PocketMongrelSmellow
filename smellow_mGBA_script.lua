@@ -1,18 +1,18 @@
--- mgba_yellow_scent_tcp_rewrite.lua
 -- Pokemon Yellow hidden item scent transmitter for mGBA.
 --
--- Clean rewrite:
---   - no LuaSocket require()
---   - uses mGBA's built-in global socket object
---   - reads map/player position
---   - checks hidden-item obtained flags
---   - finds nearest ungrabbed hidden item on current map
---   - computes 16 scent channels, 0-100
---   - sends either a 27-byte binary packet or a readable text line over TCP
---   - draws a small debug buffer in mGBA
+-- SPDX-License-Identifier: GPL-3.0-only
 --
--- Start tcp_omara_ble_bridge.py first, then load this script.
--- mGBA's socket.connect() is blocking. Yes, really. Humanity persists.
+--   no LuaSocket require()
+--   uses mGBA's built-in global socket object
+--   reads map/player position
+--   checks hidden-item obtained flags
+--   finds nearest ungrabbed hidden item on current map
+--   computes 16 scent channels, 0-100
+--   sends either a 27-byte binary packet or a readable text line over TCP
+--   draws a small debug buffer in mGBA
+--
+-- Start omara_bridge.py first, then load this script.
+-- mGBA's socket.connect() is blocking.
 
 ------------------------------------------------------------
 -- User settings

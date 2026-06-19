@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+SPDX-License-Identifier: GPL-3.0-only
+
 tcp_omara_ble_bridge_clean.py
 
 Clean TCP-to-BLE bridge for mGBA Pokemon Yellow scent packets.
