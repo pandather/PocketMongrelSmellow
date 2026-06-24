@@ -221,13 +221,15 @@ local SCENTS = {
   "Machina",
 }
 
-local SCENT_MAX_DISTANCE = 8
+local SCENT_MAX_DISTANCE = 4
+
+SCENT_MAX_DISTANCE = SCENT_MAX_DISTANCE + 1
 
 local ITEM_SCENT_PROFILE_BY_NAME = {
   ["Potion"] = {
-    {scent="Floral", ratio=0.55},
+    {scent="Floral", ratio=0.05},
     {scent="Sweet", ratio=0.30},
-    {scent="Citrus", ratio=0.15},
+    {scent="Terra Silva", ratio=0.65},
   },
   ["Super Potion"] = {
     {scent="Floral", ratio=0.45},

@@ -33,8 +33,11 @@ Lua -> Python packet, 27 bytes:
     byte 26     checksum = XOR of bytes 1..25, excluding sync
 
 Default BLE payload:
-    20 bytes:
-        ASCII "OMS1" + 16 scent bytes
+    Unity-style ION framed ASCII commands derived from scent outputs:
+        00 14 0C 00 00 7F + ASCII "TEST_nn\n"
+
+    The old experimental OMS1 payload is still available as:
+        --ble-payload omara-scent
 
 Install for real BLE:
     pip install bleak
@@ -43,11 +46,17 @@ Examples:
     No BLE, readable debug:
         python tcp_omara_ble_bridge_clean.py --no-ble --human-readable --print-payload
 
-    Real BLE:
-        python tcp_omara_ble_bridge_clean.py --ble-name omara --human-readable
+    Real BLE, ION packet crafting from game scent bytes:
+        python tcp_omara_ble_bridge_clean.py --ble-name omara --human-readable --print-payload
+
+    Real BLE, emit strongest 3 scent channels per game packet:
+        python tcp_omara_ble_bridge_clean.py --ble-name omara --ion-top-k 3 --human-readable --print-payload
 
     Send original 27-byte packet over BLE:
         python tcp_omara_ble_bridge_clean.py --ble-name omara --ble-payload raw27
+
+    Send Unity reference TEST_10 command over BLE:
+        python tcp_omara_ble_bridge_clean.py --ble-name omara --ble-payload ion-test10 --print-payload
 
 Because apparently all of this is what it takes to make a Game Boy smell like Potion.
 """
@@ -70,6 +79,27 @@ DEFAULT_TCP_PORT = 8765
 
 # From the Omara / ION BLE reference write characteristic.
 DEFAULT_WRITE_CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+
+# From the Unity wrapper's ION notification/readback characteristics.
+ION_NOTIFY_CHARACTERISTIC_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+ION_READY_STATE_CHARACTERISTIC_UUID = "6e400005-b5a3-f393-e0a9-e50e24dcca9e"
+ION_ERROR_CHARACTERISTIC_UUID = "6e400006-b5a3-f393-e0a9-e50e24dcca9e"
+
+# Unity sample command in BleDevice.cs:
+#   00 14 0C 00 00 7F 54 45 53 54 5F 31 30 0A
+# which decodes as:
+#   00 14 0C 00 00 7F + "TEST_10\n"
+#
+# The exact semantic meaning of the six-byte prefix is not present in the
+# uploaded C# wrapper, so we preserve it exactly and vary only the ASCII
+# command. That is not magic, sadly, just reverse engineering with the one
+# breadcrumb the device gave us.
+DEFAULT_ION_FRAME_PREFIX = "00 14 0c 00 00 7f"
+DEFAULT_ION_COMMAND_TEMPLATE = "TEST_{channel:02d}\n"
+DEFAULT_ION_THRESHOLD = 1
+DEFAULT_ION_TOP_K = 1
+DEFAULT_ION_FIRST_CHANNEL = 1
+DEFAULT_ION_MAX_CHANNELS = 16
 
 SCENTS: tuple[str, ...] = (
     "Marine",
@@ -281,13 +311,13 @@ class DecodedPacket:
     def distance_label(self) -> str:
         if not self.active:
             return "off"
-        if self.distance == 0:
+        if self.distance == 1:
             return "direct"
         if self.distance <= 2:
             return "near"
-        if self.distance <= 5:
+        if self.distance <= 3:
             return "medium"
-        if self.distance <= 7:
+        if self.distance <= 4:
             return "faint"
         return "far / off"
 
@@ -360,19 +390,140 @@ def extract_raw_packets(buffer: bytearray) -> Iterable[bytes]:
         yield raw
 
 
-def build_ble_payload(packet: DecodedPacket, mode: str) -> bytes:
+def parse_hex_bytes(text: str) -> bytes:
+    cleaned = text.replace(",", " ").replace("0x", " ").replace("0X", " ")
+    parts = cleaned.split()
+    if not parts:
+        raise ValueError("hex byte string is empty")
+
+    out = bytearray()
+    for part in parts:
+        if len(part) > 2:
+            # Allow compact forms like 00140c00007f too, because apparently
+            # humans enjoy representing the same six bytes seven ways.
+            if len(part) % 2 != 0:
+                raise ValueError(f"odd-length hex token: {part!r}")
+            for i in range(0, len(part), 2):
+                out.append(int(part[i : i + 2], 16))
+        else:
+            out.append(int(part, 16))
+
+    return bytes(out)
+
+
+def clamp_percent(value: int) -> int:
+    return max(0, min(100, int(value)))
+
+
+def build_ion_command_payload(
+    *,
+    channel: int,
+    index: int,
+    value: int,
+    name: str,
+    frame_prefix: bytes,
+    command_template: str,
+) -> bytes:
+    command = command_template.format(
+        channel=channel,
+        index=index,
+        value=clamp_percent(value),
+        name=name,
+    )
+    try:
+        command_bytes = command.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("ION command template must render to ASCII") from exc
+
+    return frame_prefix + command_bytes
+
+
+def strongest_scent_channels(
+    packet: DecodedPacket,
+    *,
+    threshold: int,
+    top_k: int,
+    first_channel: int,
+    max_channels: int,
+) -> list[tuple[int, int, int, str]]:
+    threshold = clamp_percent(threshold)
+    max_channels = max(1, min(max_channels, len(packet.scents)))
+
+    ranked: list[tuple[int, int, int, str]] = []
+    for index, (name, value) in enumerate(zip(SCENTS[:max_channels], packet.scents[:max_channels])):
+        value = clamp_percent(value)
+        if value < threshold:
+            continue
+        channel = first_channel + index
+        ranked.append((index, channel, value, name))
+
+    # Stronger scent first. Stable tie-breaker by original scent order.
+    ranked.sort(key=lambda item: (-item[2], item[0]))
+
+    if top_k > 0:
+        ranked = ranked[:top_k]
+
+    return ranked
+
+
+def build_ion_payloads(packet: DecodedPacket, args: argparse.Namespace) -> list[bytes]:
+    if not packet.active:
+        return []
+
+    channels = strongest_scent_channels(
+        packet,
+        threshold=args.ion_threshold,
+        top_k=args.ion_top_k,
+        first_channel=args.ion_first_channel,
+        max_channels=args.ion_max_channels,
+    )
+
+    return [
+        build_ion_command_payload(
+            channel=channel,
+            index=index,
+            value=value,
+            name=name,
+            frame_prefix=args.ion_frame_prefix_bytes,
+            command_template=args.ion_command_template,
+        )
+        for index, channel, value, name in channels
+    ]
+
+
+def build_ble_payloads(packet: DecodedPacket, args: argparse.Namespace) -> list[bytes]:
+    mode = args.ble_payload
+
+    if mode == "ion":
+        return build_ion_payloads(packet, args)
+
+    if mode == "ion-test10":
+        return [
+            build_ion_command_payload(
+                channel=10,
+                index=9,
+                value=100,
+                name="ION_TEST_10",
+                frame_prefix=args.ion_frame_prefix_bytes,
+                command_template=args.ion_command_template,
+            )
+        ]
+
+    # Legacy bridge-local payloads. Useful for comparison, but not expected to
+    # make stock ION/Omara firmware emit scent unless you wrote firmware that
+    # understands them.
     if mode == "omara-scent":
-        return b"OMS1" + bytes(packet.scents)
+        return [b"OMS1" + bytes(packet.scents)]
 
     if mode == "omara-scent-checksum":
         body = b"OMS1" + bytes(packet.scents)
-        return body + bytes([xor_bytes(body)])
+        return [body + bytes([xor_bytes(body)])]
 
     if mode == "raw27":
-        return packet.raw
+        return [packet.raw]
 
     if mode == "human":
-        return (format_one_line(packet) + "\n").encode("utf-8")
+        return [(format_one_line(packet) + "\n").encode("utf-8")]
 
     raise ValueError(f"unknown BLE payload mode: {mode}")
 
@@ -458,6 +609,7 @@ class BleSink:
         scan_timeout: float,
         connect_timeout: float,
         write_response: bool,
+        subscribe_notifications: bool,
     ) -> None:
         self.ble_name = ble_name
         self.ble_address = ble_address
@@ -465,6 +617,7 @@ class BleSink:
         self.scan_timeout = scan_timeout
         self.connect_timeout = connect_timeout
         self.write_response = write_response
+        self.subscribe_notifications = subscribe_notifications
         self.client: Any = None
 
     async def connect(self) -> None:
@@ -507,6 +660,31 @@ class BleSink:
 
         print(f"BLE connected; write characteristic={self.characteristic_uuid}", flush=True)
 
+        if self.subscribe_notifications:
+            await self.subscribe_to_ion_notifications()
+
+    async def subscribe_to_ion_notifications(self) -> None:
+        if self.client is None or not self.client.is_connected:
+            raise RuntimeError("BLE client is not connected")
+
+        def on_notify(sender: Any, data: bytearray) -> None:
+            payload = bytes(data)
+            print(
+                f"BLE notify from {sender}: hex={hex_bytes(payload)} ascii={payload!r}",
+                flush=True,
+            )
+
+        for uuid in (
+            ION_NOTIFY_CHARACTERISTIC_UUID,
+            ION_READY_STATE_CHARACTERISTIC_UUID,
+            ION_ERROR_CHARACTERISTIC_UUID,
+        ):
+            try:
+                await self.client.start_notify(uuid, on_notify)
+                print(f"Subscribed to BLE notifications: {uuid}", flush=True)
+            except Exception as exc:
+                print(f"BLE subscribe failed for {uuid}: {exc}", file=sys.stderr, flush=True)
+
     async def write(self, payload: bytes) -> None:
         if self.client is None or not self.client.is_connected:
             raise RuntimeError("BLE client is not connected")
@@ -543,7 +721,7 @@ async def handle_mgba_client(
     print(f"mGBA connected from {peer}", flush=True)
 
     buffer = bytearray()
-    last_payload: Optional[bytes] = None
+    last_payloads: Optional[tuple[bytes, ...]] = None
 
     try:
         while True:
@@ -564,35 +742,60 @@ async def handle_mgba_client(
                     continue
 
                 stats.valid_packets += 1
-                payload = build_ble_payload(packet, args.ble_payload)
+                payloads = build_ble_payloads(packet, args)
+                payload_key = tuple(payloads)
 
                 if not args.quiet:
                     print_packet(packet, human_readable=args.human_readable)
 
-                if args.suppress_duplicates and payload == last_payload:
+                if not payloads:
                     stats.payloads_skipped += 1
                     if not args.quiet:
+                        print(
+                            f"BLE: no payload generated; mode={args.ble_payload} "
+                            f"threshold={args.ion_threshold}",
+                            flush=True,
+                        )
+                    last_payloads = payload_key
+                    continue
+
+                if args.suppress_duplicates and payload_key == last_payloads:
+                    stats.payloads_skipped += len(payloads)
+                    if not args.quiet:
                         label = "DRY RUN" if args.no_ble else "BLE"
-                        print(f"{label}: skipped unchanged payload; mode={args.ble_payload}", flush=True)
+                        print(
+                            f"{label}: skipped unchanged payload set; "
+                            f"mode={args.ble_payload}; count={len(payloads)}",
+                            flush=True,
+                        )
                     continue
 
-                try:
-                    await sink.write(payload)
-                except Exception as exc:
-                    print(f"BLE write failed: {exc}", file=sys.stderr, flush=True)
-                    continue
+                wrote_all = True
+                for payload_index, payload in enumerate(payloads, start=1):
+                    try:
+                        await sink.write(payload)
+                    except Exception as exc:
+                        wrote_all = False
+                        print(f"BLE write failed: {exc}", file=sys.stderr, flush=True)
+                        continue
 
-                last_payload = payload
-                stats.payloads_written += 1
+                    stats.payloads_written += 1
 
-                if not args.quiet:
-                    label = "dry-run" if args.no_ble else "sent"
-                    print(f"BLE: {label}; payload_mode={args.ble_payload}; bytes={len(payload)}", flush=True)
-                    if args.print_payload:
-                        if args.ble_payload == "human":
-                            print(payload.decode("utf-8", errors="replace").rstrip("\n"), flush=True)
-                        else:
-                            print(f"Payload: {hex_bytes(payload)}", flush=True)
+                    if not args.quiet:
+                        label = "dry-run" if args.no_ble else "sent"
+                        print(
+                            f"BLE: {label}; payload_mode={args.ble_payload}; "
+                            f"payload={payload_index}/{len(payloads)}; bytes={len(payload)}",
+                            flush=True,
+                        )
+                        if args.print_payload:
+                            if args.ble_payload == "human":
+                                print(payload.decode("utf-8", errors="replace").rstrip("\n"), flush=True)
+                            else:
+                                print(f"Payload[{payload_index}]: {hex_bytes(payload)}", flush=True)
+
+                if wrote_all:
+                    last_payloads = payload_key
 
     finally:
         writer.close()
@@ -641,6 +844,7 @@ async def make_sink(args: argparse.Namespace) -> PayloadSink:
         scan_timeout=args.scan_timeout,
         connect_timeout=args.connect_timeout,
         write_response=args.write_response,
+        subscribe_notifications=not args.no_subscribe_notifications,
     )
     await sink.connect()
     return sink
@@ -668,13 +872,55 @@ def build_parser() -> argparse.ArgumentParser:
     ble.add_argument("--scan-timeout", type=float, default=15.0, help="BLE scan timeout seconds")
     ble.add_argument("--connect-timeout", type=float, default=30.0, help="BLE connect timeout seconds")
     ble.add_argument("--write-response", action="store_true", help="use BLE write-with-response")
+    ble.add_argument(
+        "--no-subscribe-notifications",
+        action="store_true",
+        help="do not subscribe to ION notification/ready/error characteristics",
+    )
 
     payload = parser.add_argument_group("Payload")
     payload.add_argument(
         "--ble-payload",
-        choices=("omara-scent", "omara-scent-checksum", "raw27", "human"),
-        default="omara-scent",
-        help="payload sent to BLE",
+        choices=("ion", "ion-test10", "omara-scent", "omara-scent-checksum", "raw27", "human"),
+        default="ion",
+        help="payload sent to BLE; default crafts Unity-style ION TEST_nn packets from scent outputs",
+    )
+    payload.add_argument(
+        "--ion-frame-prefix",
+        default=DEFAULT_ION_FRAME_PREFIX,
+        help="hex bytes prepended before each ASCII ION command",
+    )
+    payload.add_argument(
+        "--ion-command-template",
+        default=DEFAULT_ION_COMMAND_TEMPLATE,
+        help=(
+            "ASCII command template. Available fields: "
+            "{channel}, {index}, {value}, {name}. Default: TEST_{channel:02d}\\n"
+        ),
+    )
+    payload.add_argument(
+        "--ion-threshold",
+        type=int,
+        default=DEFAULT_ION_THRESHOLD,
+        help="minimum scent value 0-100 needed to emit an ION TEST command",
+    )
+    payload.add_argument(
+        "--ion-top-k",
+        type=int,
+        default=DEFAULT_ION_TOP_K,
+        help="number of strongest scent channels to emit per game packet; 0 means all above threshold",
+    )
+    payload.add_argument(
+        "--ion-first-channel",
+        type=int,
+        default=DEFAULT_ION_FIRST_CHANNEL,
+        help="ION command channel for SCENTS[0]; default maps SCENTS[0] to TEST_01",
+    )
+    payload.add_argument(
+        "--ion-max-channels",
+        type=int,
+        default=DEFAULT_ION_MAX_CHANNELS,
+        help="how many SCENTS entries are mapped to ION channels",
     )
     payload.add_argument(
         "--send-duplicates",
@@ -688,10 +934,50 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    try:
+        args.ion_frame_prefix_bytes = parse_hex_bytes(args.ion_frame_prefix)
+    except ValueError as exc:
+        print(f"fatal: invalid --ion-frame-prefix: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    if args.ion_top_k < 0:
+        print("fatal: --ion-top-k must be >= 0", file=sys.stderr, flush=True)
+        return 2
+
+    if args.ion_first_channel < 0:
+        print("fatal: --ion-first-channel must be >= 0", file=sys.stderr, flush=True)
+        return 2
+
+    if args.ion_max_channels <= 0:
+        print("fatal: --ion-max-channels must be > 0", file=sys.stderr, flush=True)
+        return 2
+
+    # Validate the template early so failures do not wait until mGBA connects.
+    try:
+        build_ion_command_payload(
+            channel=10,
+            index=9,
+            value=100,
+            name="ION_TEST_10",
+            frame_prefix=args.ion_frame_prefix_bytes,
+            command_template=args.ion_command_template,
+        )
+    except Exception as exc:
+        print(f"fatal: invalid --ion-command-template: {exc}", file=sys.stderr, flush=True)
+        return 2
+
     if args.ble_payload == "human":
         print(
             "Note: --ble-payload human can exceed small BLE write sizes. "
-            "Use omara-scent unless your receiver expects text.",
+            "Use ion unless your receiver expects text.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if args.ble_payload.startswith("omara-scent"):
+        print(
+            "Note: omara-scent modes send the old experimental OMS1 payload. "
+            "The default ion mode now crafts Unity-style ION TEST_nn commands.",
             file=sys.stderr,
             flush=True,
         )
