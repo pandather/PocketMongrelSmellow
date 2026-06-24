@@ -33,11 +33,14 @@ Lua -> Python packet, 27 bytes:
     byte 26     checksum = XOR of bytes 1..25, excluding sync
 
 Default BLE payload:
-    Unity-style ION framed ASCII commands derived from scent outputs:
-        00 14 0C 00 00 7F + ASCII "TEST_nn\n"
+    Unity-style ION framed ASCII commands derived from scent outputs, including intensity:
+        00 14 0C 00 00 7F + ASCII "TEST_nn_vvv\n"
 
     The old experimental OMS1 payload is still available as:
         --ble-payload omara-scent
+
+    To send the exact Unity sample channel-only shape instead of intensity:
+        --ion-command-template "TEST_{channel:02d}\n"
 
 Install for real BLE:
     pip install bleak
@@ -95,11 +98,23 @@ ION_ERROR_CHARACTERISTIC_UUID = "6e400006-b5a3-f393-e0a9-e50e24dcca9e"
 # command. That is not magic, sadly, just reverse engineering with the one
 # breadcrumb the device gave us.
 DEFAULT_ION_FRAME_PREFIX = "00 14 0c 00 00 7f"
-DEFAULT_ION_COMMAND_TEMPLATE = "TEST_{channel:02d}\n"
+DEFAULT_ION_COMMAND_TEMPLATE = "TEST_{channel:02d}_{value:03d}\n"
 DEFAULT_ION_THRESHOLD = 1
-DEFAULT_ION_TOP_K = 1
+DEFAULT_ION_TOP_K = 3
 DEFAULT_ION_FIRST_CHANNEL = 1
 DEFAULT_ION_MAX_CHANNELS = 16
+
+# Unreal OVR production packet skeleton, inferred from OVRMessage.cpp and
+# OVRMessageTypes.h:
+#   e3 14 <payload_len> 00 + repeated 4-byte odorant commands
+# The uploaded source does not include Data/OdorantCommand.h/.cpp, so the
+# inner 4-byte command format is inferred from comments and the testPacket:
+#   <slot> <algorithm> <intensity_0_255> 00
+DEFAULT_OVR_ODORANT_HEADER_START = 0xE3
+DEFAULT_OVR_ODORANT_COMMANDS_TYPE = 0x14
+DEFAULT_OVR_ALGORITHM = 0
+DEFAULT_OVR_SLOTS = 9
+DEFAULT_OVR_SLOT_MAP = "0,1,2,3,4,5,6,7,8"
 
 SCENTS: tuple[str, ...] = (
     "Marine",
@@ -415,6 +430,86 @@ def clamp_percent(value: int) -> int:
     return max(0, min(100, int(value)))
 
 
+
+def parse_int_csv(value: str, *, name: str) -> list[int]:
+    items: list[int] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        try:
+            items.append(int(part, 0))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated list of integers") from exc
+    return items
+
+
+def percent_to_u8(value: int) -> int:
+    return max(0, min(255, round(clamp_percent(value) * 255 / 100)))
+
+
+def build_ovr_odorant_command(*, slot: int, algorithm: int, intensity: int) -> bytes:
+    if not 0 <= slot <= 255:
+        raise ValueError(f"OVR odor slot {slot} is outside byte range 0-255")
+    if not 0 <= algorithm <= 255:
+        raise ValueError(f"OVR algorithm {algorithm} is outside byte range 0-255")
+    if not 0 <= intensity <= 255:
+        raise ValueError(f"OVR intensity {intensity} is outside byte range 0-255")
+
+    # Inferred from the Unreal comments/examples:
+    #   e3 14 08 00 00 01 ff 00 00 02 ff 00
+    # and the test packet:
+    #   e3 14 24 00 00 00 00 00 01 00 00 00 ... 05 00 ff 00 ...
+    # The strongest consistent interpretation is:
+    #   slot, algorithm, intensity, terminator/reserved
+    return bytes((slot, algorithm, intensity, 0x00))
+
+
+def build_ovr_binary_payloads(packet: DecodedPacket, args: argparse.Namespace) -> list[bytes]:
+    if not packet.active:
+        return []
+
+    slot_map = args.ovr_slot_map_values
+    slot_count = args.ovr_slots
+    if slot_count <= 0:
+        return []
+
+    intensities = [0] * slot_count
+    for slot, scent_index in enumerate(slot_map[:slot_count]):
+        if not 0 <= scent_index < len(packet.scents):
+            continue
+        scent_value = clamp_percent(packet.scents[scent_index])
+        if scent_value < args.ion_threshold:
+            continue
+        intensities[slot] = percent_to_u8(scent_value)
+
+    command_bytes = bytearray()
+    for slot, intensity in enumerate(intensities):
+        if not args.ovr_full_slots and intensity <= 0:
+            continue
+        command_bytes.extend(
+            build_ovr_odorant_command(
+                slot=slot,
+                algorithm=args.ovr_algorithm,
+                intensity=intensity,
+            )
+        )
+
+    if not command_bytes:
+        return []
+    if len(command_bytes) > 255:
+        raise ValueError("OVR odorant payload is too large for one-byte payload length")
+
+    return [
+        bytes((
+            DEFAULT_OVR_ODORANT_HEADER_START,
+            DEFAULT_OVR_ODORANT_COMMANDS_TYPE,
+            len(command_bytes),
+            0x00,
+        )) + bytes(command_bytes)
+    ]
+
+
 def build_ion_command_payload(
     *,
     channel: int,
@@ -494,20 +589,17 @@ def build_ion_payloads(packet: DecodedPacket, args: argparse.Namespace) -> list[
 def build_ble_payloads(packet: DecodedPacket, args: argparse.Namespace) -> list[bytes]:
     mode = args.ble_payload
 
+    if mode in ("ovr-binary", "ovr-odorant"):
+        return build_ovr_binary_payloads(packet, args)
+
     if mode == "ion":
         return build_ion_payloads(packet, args)
 
     if mode == "ion-test10":
-        return [
-            build_ion_command_payload(
-                channel=10,
-                index=9,
-                value=100,
-                name="ION_TEST_10",
-                frame_prefix=args.ion_frame_prefix_bytes,
-                command_template=args.ion_command_template,
-            )
-        ]
+        # Exact Unity reference payload from BleDevice.cs, regardless of the
+        # runtime command template. This is the known breadcrumb; do not
+        # accidentally turn it into TEST_10_100\n while testing.
+        return [args.ion_frame_prefix_bytes + b"TEST_10\n"]
 
     # Legacy bridge-local payloads. Useful for comparison, but not expected to
     # make stock ION/Omara firmware emit scent unless you wrote firmware that
@@ -881,9 +973,9 @@ def build_parser() -> argparse.ArgumentParser:
     payload = parser.add_argument_group("Payload")
     payload.add_argument(
         "--ble-payload",
-        choices=("ion", "ion-test10", "omara-scent", "omara-scent-checksum", "raw27", "human"),
-        default="ion",
-        help="payload sent to BLE; default crafts Unity-style ION TEST_nn packets from scent outputs",
+        choices=("ovr-binary", "ovr-odorant", "ion", "ion-test10", "omara-scent", "omara-scent-checksum", "raw27", "human"),
+        default="ovr-binary",
+        help="payload sent to BLE; default crafts Unreal OVR ODORANT_COMMANDS binary packets",
     )
     payload.add_argument(
         "--ion-frame-prefix",
@@ -902,7 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ion-threshold",
         type=int,
         default=DEFAULT_ION_THRESHOLD,
-        help="minimum scent value 0-100 needed to emit an ION TEST command",
+        help="minimum scent value 0-100 needed to emit an ION command",
     )
     payload.add_argument(
         "--ion-top-k",
@@ -922,6 +1014,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ION_MAX_CHANNELS,
         help="how many SCENTS entries are mapped to ION channels",
     )
+    payload.add_argument(
+        "--ovr-slots",
+        type=int,
+        default=DEFAULT_OVR_SLOTS,
+        help="number of OVR odorant slots to send in ovr-binary mode; default 9",
+    )
+    payload.add_argument(
+        "--ovr-slot-map",
+        default=DEFAULT_OVR_SLOT_MAP,
+        help=(
+            "comma-separated SCENTS indexes mapped to OVR slots. "
+            "Default maps slots 0..8 to SCENTS[0..8]. Example: 4,5,10 maps slot0=Floral, slot1=Sweet, slot2=Citrus"
+        ),
+    )
+    payload.add_argument(
+        "--ovr-algorithm",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_OVR_ALGORITHM,
+        help="middle byte in each 4-byte OVR odor command; default 0, matching the uploaded testPacket",
+    )
+    payload.add_argument(
+        "--ovr-sparse",
+        dest="ovr_full_slots",
+        action="store_false",
+        help="in ovr-binary mode, send only nonzero slots instead of all slots",
+    )
+    payload.set_defaults(ovr_full_slots=True)
     payload.add_argument(
         "--send-duplicates",
         dest="suppress_duplicates",
@@ -951,6 +1070,39 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.ion_max_channels <= 0:
         print("fatal: --ion-max-channels must be > 0", file=sys.stderr, flush=True)
         return 2
+    
+    try:
+        args.ovr_slot_map_values = parse_int_csv(args.ovr_slot_map, name="--ovr-slot-map")
+    except ValueError as exc:
+        print(f"fatal: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    if args.ovr_slots <= 0:
+        print("fatal: --ovr-slots must be > 0", file=sys.stderr, flush=True)
+        return 2
+
+    if len(args.ovr_slot_map_values) < args.ovr_slots:
+        print(
+            f"fatal: --ovr-slot-map has {len(args.ovr_slot_map_values)} entries, "
+            f"but --ovr-slots is {args.ovr_slots}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
+    if not 0 <= args.ovr_algorithm <= 255:
+        print("fatal: --ovr-algorithm must be in byte range 0..255", file=sys.stderr, flush=True)
+        return 2
+
+    for scent_index in args.ovr_slot_map_values[:args.ovr_slots]:
+        if not 0 <= scent_index < len(SCENTS):
+            print(
+                f"fatal: --ovr-slot-map contains scent index {scent_index}, "
+                f"but valid SCENTS indexes are 0..{len(SCENTS) - 1}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
 
     # Validate the template early so failures do not wait until mGBA connects.
     try:
@@ -977,7 +1129,7 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.ble_payload.startswith("omara-scent"):
         print(
             "Note: omara-scent modes send the old experimental OMS1 payload. "
-            "The default ion mode now crafts Unity-style ION TEST_nn commands.",
+            "The default ion mode now crafts Unity-style ION channel+intensity commands.",
             file=sys.stderr,
             flush=True,
         )
